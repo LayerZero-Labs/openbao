@@ -376,6 +376,26 @@ func (lm *LockManager) GetPolicyWithLockType(ctx context.Context, req PolicyRequ
 				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
 			}
 
+		case KeyType_ECDSA_SECP256K1:
+			if req.Derived || req.Convergent {
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
+			// Auto-rotation is rejected for this type on purpose, mirroring
+			// KeyType_ExternalKey above.
+			//
+			// A secp256k1 key's identity to a verifier is its public key, or a
+			// fingerprint of it, enrolled with that verifier out of band.
+			// Rotating the key changes it. Worse, clients commonly cache the
+			// public key for their process lifetime, so after a rotation they
+			// would keep signing and keep reporting the old identity --
+			// producing signatures the verifier rejects with no local error.
+			// Rotate deliberately by creating a new key and enrolling it, not
+			// on a timer.
+			if req.AutoRotatePeriod != 0 {
+				return nil, false, fmt.Errorf("auto-rotation is not supported for keys of type %v, because rotation changes the derived blockchain address", req.KeyType)
+			}
+
 		case KeyType_ED25519:
 			if req.Convergent {
 				return nil, false, fmt.Errorf("convergent encryption not supported for keys of type %v", req.KeyType)

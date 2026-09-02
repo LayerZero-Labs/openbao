@@ -237,6 +237,8 @@ func getExportKey(policy *keysutil.Policy, key *keysutil.KeyEntry, exportType st
 				return "", err
 			}
 			return ecKey, nil
+		case keysutil.KeyType_ECDSA_SECP256K1:
+			return keyEntryToSecp256k1PrivateKey(key, format)
 		case keysutil.KeyType_ED25519:
 			if len(key.Key) == 0 {
 				return "", nil
@@ -274,6 +276,8 @@ func getExportKey(policy *keysutil.Policy, key *keysutil.KeyEntry, exportType st
 				return "", err
 			}
 			return ecKey, nil
+		case keysutil.KeyType_ECDSA_SECP256K1:
+			return keyEntryToSecp256k1PublicKey(key, format)
 		case keysutil.KeyType_ED25519:
 			return encodeED25519PublicKey(key, format)
 		case keysutil.KeyType_RSA2048, keysutil.KeyType_RSA3072, keysutil.KeyType_RSA4096:
@@ -592,6 +596,79 @@ func encodeMLDSAPublicKey(k *keysutil.KeyEntry, format string, params mldsa.Para
 }
 
 const pathExportHelpSyn = `Export named encryption or signing key`
+
+// keyEntryToSecp256k1PrivateKey encodes a secp256k1 key version's private half.
+//
+// This mirrors keyEntryToECPrivateKey's format semantics exactly, but cannot
+// share its implementation: Go's crypto/x509 marshalers reject the secp256k1
+// curve OID, so the encoding is delegated to keysutil instead. See the comment
+// block at the top of sdk/helper/keysutil/secp256k1.go.
+func keyEntryToSecp256k1PrivateKey(k *keysutil.KeyEntry, format string) (string, error) {
+	if format == "raw" {
+		return "", errors.New("unknown key format for ec key; supported values are ``, `der`, or `pem`")
+	}
+
+	if k == nil {
+		return "", errors.New("nil KeyEntry provided")
+	}
+
+	if k.IsPrivateKeyMissing() {
+		return "", nil
+	}
+
+	var blockType string
+	var derBytes []byte
+	var err error
+	switch format {
+	case "":
+		derBytes, err = keysutil.MarshalSecp256k1SEC1PrivateKey(k.EC_D, k.EC_X, k.EC_Y)
+		blockType = "EC PRIVATE KEY"
+	case "der", "pem":
+		derBytes, err = keysutil.MarshalSecp256k1PKCS8PrivateKey(k.EC_D, k.EC_X, k.EC_Y)
+		blockType = "PRIVATE KEY"
+	}
+	if err != nil {
+		return "", err
+	}
+
+	if format == "der" {
+		return base64.StdEncoding.EncodeToString(derBytes), nil
+	}
+
+	pemBlock := pem.Block{
+		Type:  blockType,
+		Bytes: derBytes,
+	}
+
+	return strings.TrimSpace(string(pem.EncodeToMemory(&pemBlock))), nil
+}
+
+// keyEntryToSecp256k1PublicKey encodes a secp256k1 key version's public half.
+func keyEntryToSecp256k1PublicKey(k *keysutil.KeyEntry, format string) (string, error) {
+	if format == "raw" {
+		return "", errors.New("unknown key format for ec key; supported values are ``, `der`, or `pem`")
+	}
+
+	if k == nil {
+		return "", errors.New("nil KeyEntry provided")
+	}
+
+	derBytes, err := keysutil.MarshalSecp256k1PKIXPublicKey(k.EC_X, k.EC_Y)
+	if err != nil {
+		return "", err
+	}
+
+	if format == "der" {
+		return base64.StdEncoding.EncodeToString(derBytes), nil
+	}
+
+	pemBlock := pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: derBytes,
+	}
+
+	return strings.TrimSpace(string(pem.EncodeToMemory(&pemBlock))), nil
+}
 
 const pathExportHelpDesc = `
 This path is used to export the named keys that are configured as

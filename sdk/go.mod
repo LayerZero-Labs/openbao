@@ -14,6 +14,7 @@ require (
 	github.com/armon/go-radix v1.0.0
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/containerd/errdefs v1.0.0
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/go-ldap/ldap/v3 v3.4.14

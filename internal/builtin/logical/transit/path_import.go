@@ -229,6 +229,11 @@ func (b *backend) pathImportWrite(ctx context.Context, req *logical.Request, d *
 		polReq.KeyType = keysutil.KeyType_MLDSA87
 	case "hmac":
 		polReq.KeyType = keysutil.KeyType_HMAC
+	case "ecdsa-secp256k1", "ecdsa-p256k1":
+		// Handled explicitly so the error names the real reason rather than
+		// claiming the type is unknown: Go's x509 parsers do not recognise the
+		// secp256k1 curve OID, so there is no import path for this curve.
+		return logical.ErrorResponse("importing key material is not supported for key type %v; create the key with transit/keys instead and enrol its public key with the verifier", keyType), logical.ErrInvalidRequest
 	default:
 		return logical.ErrorResponse("unknown key type: %v", keyType), logical.ErrInvalidRequest
 	}

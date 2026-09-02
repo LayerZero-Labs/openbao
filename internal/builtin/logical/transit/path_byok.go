@@ -206,6 +206,12 @@ func getBYOKExportKey(dstP *keysutil.Policy, srcP *keysutil.Policy, key *keysuti
 		if err != nil {
 			return "", err
 		}
+	case keysutil.KeyType_ECDSA_SECP256K1:
+		// BYOK wrapping hands the key to WrapKey, which needs a stdlib key
+		// object; secp256k1 deliberately has no crypto/ecdsa representation
+		// here (see sdk/helper/keysutil/secp256k1.go). Return the real reason
+		// rather than the default branch's "unknown key type".
+		return "", fmt.Errorf("BYOK export is not supported for key type %v", srcP.Type)
 	default:
 		return "", fmt.Errorf("unable to export to unknown key type: %v", srcP.Type)
 	}

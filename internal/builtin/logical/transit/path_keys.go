@@ -74,9 +74,15 @@ func (b *backend) pathKeys() *framework.Path {
 				Description: `
 The type of key to create. Currently, "aes128-gcm96", "aes256-gcm96",
 "chacha20-poly1305", "xchacha20-poly1305" (symmetric); "ecdsa-p256",
-"ecdsa-p384", "ecdsa-p521", "ed25519", "rsa-2048", "rsa-3072", "rsa-4096",
-"mldsa-44", "mldsa-65", "mldsa-87" (asymmetric); "external-key" (symmetric or
-asymmetric) are supported. Defaults to "aes256-gcm96".
+"ecdsa-p384", "ecdsa-p521", "ecdsa-secp256k1", "ed25519", "rsa-2048",
+"rsa-3072", "rsa-4096", "mldsa-44", "mldsa-65", "mldsa-87" (asymmetric);
+"external-key" (symmetric or asymmetric) are supported. Defaults to
+"aes256-gcm96".
+
+Note that "ecdsa-secp256k1" signs a caller-supplied 32-byte digest verbatim and
+does not hash its input, since blockchain signing schemes use Keccak-256 with
+their own domain separation. It also does not support key import, key
+agreement, CSR generation, or auto-rotation.
 `,
 			},
 
@@ -293,6 +299,11 @@ func (b *backend) pathPolicyWrite(ctx context.Context, req *logical.Request, d *
 		polReq.KeyType = keysutil.KeyType_ECDSA_P384
 	case "ecdsa-p521":
 		polReq.KeyType = keysutil.KeyType_ECDSA_P521
+	case "ecdsa-secp256k1", "ecdsa-p256k1":
+		// "ecdsa-p256k1" is accepted as an alias in case the other spelling is
+		// the one that gets standardised on. The
+		// canonical name, returned by KeyType.String(), is "ecdsa-secp256k1".
+		polReq.KeyType = keysutil.KeyType_ECDSA_SECP256K1
 	case "ed25519":
 		polReq.KeyType = keysutil.KeyType_ED25519
 	case "rsa-2048":
@@ -459,7 +470,10 @@ func (b *backend) formatKeyPolicy(p *keysutil.Policy, context []byte) (*logical.
 		}
 		resp.Data["keys"] = retKeys
 
+	// NOTE: this switch has no default branch, so a key type missing from this
+	// case list returns a response with no "keys" data at all and no error.
 	case keysutil.KeyType_ECDSA_P256, keysutil.KeyType_ECDSA_P384, keysutil.KeyType_ECDSA_P521, keysutil.KeyType_ED25519,
+		keysutil.KeyType_ECDSA_SECP256K1,
 		keysutil.KeyType_RSA2048, keysutil.KeyType_RSA3072, keysutil.KeyType_RSA4096,
 		keysutil.KeyType_MLDSA44, keysutil.KeyType_MLDSA65, keysutil.KeyType_MLDSA87:
 		retKeys := map[string]map[string]any{}
@@ -493,6 +507,12 @@ func (b *backend) formatKeyPolicy(p *keysutil.Policy, context []byte) (*logical.
 				key.Name = elliptic.P384().Params().Name
 			case keysutil.KeyType_ECDSA_P521:
 				key.Name = elliptic.P521().Params().Name
+			case keysutil.KeyType_ECDSA_SECP256K1:
+				// Hardcoded rather than read from a curve object, so that the
+				// decred dependency stays confined to the sdk module. This
+				// literal is also the RFC 8812 JWK "crv" value, matching how
+				// "P-256" above doubles as the JWK name for that curve.
+				key.Name = "secp256k1"
 			case keysutil.KeyType_ED25519:
 				if p.Derived {
 					if len(context) == 0 {

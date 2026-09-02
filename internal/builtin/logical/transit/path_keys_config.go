@@ -231,6 +231,18 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 		if p.Type == keysutil.KeyType_ExternalKey && p.AutoRotatePeriod != 0 {
 			return logical.ErrorResponse("auto rotate period must be disabled on external keys"), nil
 		}
+
+		// The same guard exists in keysutil's key-creation path, but it must be
+		// repeated here or it could simply be bypassed by creating the key
+		// without auto-rotation and then enabling it via this endpoint.
+		//
+		// Rotating a secp256k1 key changes its public key, which is the
+		// identity a verifier has enrolled out of band. Clients also commonly
+		// cache that identity for their process lifetime, so a surprise
+		// rotation makes them keep signing under one that no longer matches.
+		if p.Type == keysutil.KeyType_ECDSA_SECP256K1 && p.AutoRotatePeriod != 0 {
+			return logical.ErrorResponse("auto rotate period must be disabled on ecdsa-secp256k1 keys, because rotation changes the derived blockchain address"), nil
+		}
 	}
 
 	if !persistNeeded {

@@ -38,6 +38,8 @@ import (
 	"golang.org/x/crypto/ed25519"
 	"golang.org/x/crypto/hkdf"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	dcrecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/hashicorp/go-uuid"
 	"github.com/openbao/go-kms-wrapping/v2/kms"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
@@ -60,6 +62,12 @@ const (
 )
 
 // Or this one...we need the default of zero to be the original AES256-GCM96
+//
+// APPEND ONLY. These are implicit iota values and Policy.Type is persisted to
+// storage as the raw integer (see the `json:"type"` tag on Policy.Type), so
+// inserting or reordering a constant silently reinterprets every key already
+// written by an older version. New key types go at the end of the list, just
+// before KeyType_ExternalKey.
 const (
 	KeyType_AES256_GCM96 = iota
 	KeyType_ECDSA_P256
@@ -76,6 +84,7 @@ const (
 	KeyType_MLDSA44
 	KeyType_MLDSA65
 	KeyType_MLDSA87
+	KeyType_ECDSA_SECP256K1
 
 	// External keys is a meta-type.
 	KeyType_ExternalKey = 10000
@@ -157,6 +166,7 @@ func (kt KeyType) DecryptionSupported() bool {
 func (kt KeyType) SigningSupported() bool {
 	switch kt {
 	case KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521, KeyType_ED25519,
+		KeyType_ECDSA_SECP256K1,
 		KeyType_RSA2048, KeyType_RSA3072, KeyType_RSA4096,
 		KeyType_MLDSA44, KeyType_MLDSA65, KeyType_MLDSA87,
 		KeyType_ExternalKey:
@@ -175,6 +185,19 @@ func (kt KeyType) MLDSAExternalMuSupported() bool {
 	}
 }
 
+// HashSignatureInput reports whether the transit backend should hash the
+// caller's input before handing it to Sign.
+//
+// KeyType_ECDSA_SECP256K1 is deliberately absent. Callers of a secp256k1 key
+// sign a digest they computed themselves under a domain-separating scheme the
+// backend cannot reconstruct -- an Ethereum RLP transaction hash, an EIP-191
+// personal_sign digest, an EIP-712 struct hash -- and those all use Keccak-256,
+// which is not in HashType at all (sha3-* here is FIPS-202, a different
+// padding). Returning true would mean that a caller who omitted prehashed=true
+// got their digest silently SHA-256'd and signed, producing a perfectly valid
+// signature over the wrong 32 bytes with no error and no way to detect it from
+// the response. Instead this type takes a raw 32-byte digest, like ed25519 and
+// mldsa-*, and Sign/VerifySignature reject any other input length.
 func (kt KeyType) HashSignatureInput() bool {
 	switch kt {
 	case KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521,
@@ -267,6 +290,8 @@ func (kt KeyType) String() string {
 		return "mldsa-65"
 	case KeyType_MLDSA87:
 		return "mldsa-87"
+	case KeyType_ECDSA_SECP256K1:
+		return "ecdsa-secp256k1"
 	case KeyType_ExternalKey:
 		return "external-key"
 	}
@@ -1400,6 +1425,56 @@ func (p *Policy) SignWithOptions(ver int, derivationContext, input []byte, optio
 			return nil, errutil.UserError{Err: "requested marshaling type is invalid"}
 		}
 
+	case KeyType_ECDSA_SECP256K1:
+		// See the comment block at the top of secp256k1.go for why this branch
+		// does not go through crypto/ecdsa.
+		//
+		// HashSignatureInput() is false for this type, so input arrives exactly
+		// as the caller supplied it and must already be a digest. Enforce the
+		// width: decred's ModNScalar.SetByteSlice zero-extends a short slice and
+		// truncates a long one, so without this check a caller who passed a
+		// 20-byte or 64-byte value would get a valid signature over a scalar
+		// they never intended.
+		if len(input) != secp256k1ScalarSize {
+			return nil, errutil.UserError{Err: fmt.Sprintf(
+				"secp256k1 signing requires a %d-byte digest as input, got %d bytes; hash the message yourself (Ethereum uses Keccak-256) and pass the digest",
+				secp256k1ScalarSize, len(input))}
+		}
+
+		privKey, err := Secp256k1PrivFromKeyEntry(&keyParams)
+		if err != nil {
+			return nil, err
+		}
+		defer privKey.Zero()
+
+		// decred's Sign is RFC 6979 deterministic and already emits a low-S
+		// (BIP-62 canonical) signature, so there is deliberately no n-s
+		// normalization here.
+		signature := dcrecdsa.Sign(privKey, input)
+
+		switch marshaling {
+		case MarshalingTypeASN1:
+			// Serialize() produces strict, minimally-encoded, low-S DER. Do not
+			// round-trip this through encoding/asn1: that would gain nothing and
+			// risks emitting a non-minimal INTEGER.
+			sig = signature.Serialize()
+
+		case MarshalingTypeJWS:
+			// Fixed-width r||s. secp256k1 is a 256-bit curve, so this is always
+			// exactly 64 bytes.
+			r, s := signature.R(), signature.S()
+			var rb, sb [secp256k1ScalarSize]byte
+			r.PutBytes(&rb)
+			s.PutBytes(&sb)
+
+			sig = make([]byte, 0, 2*secp256k1ScalarSize)
+			sig = append(sig, rb[:]...)
+			sig = append(sig, sb[:]...)
+
+		default:
+			return nil, errutil.UserError{Err: "requested marshaling type is invalid"}
+		}
+
 	case KeyType_ED25519:
 		var key ed25519.PrivateKey
 
@@ -1650,6 +1725,79 @@ func (p *Policy) VerifySignatureWithOptions(derivationContext, input []byte, sig
 		}
 
 		return ecdsa.Verify(key, input, ecdsaSig.R, ecdsaSig.S), nil
+
+	case KeyType_ECDSA_SECP256K1:
+		// See the comment block at the top of secp256k1.go for why this branch
+		// does not go through crypto/ecdsa.
+		if len(input) != secp256k1ScalarSize {
+			return false, errutil.UserError{Err: fmt.Sprintf(
+				"secp256k1 verification requires a %d-byte digest as input, got %d bytes",
+				secp256k1ScalarSize, len(input))}
+		}
+
+		var r, s secp256k1.ModNScalar
+
+		switch marshaling {
+		case MarshalingTypeASN1:
+			// Parse with encoding/asn1 and the shared ecdsaSignature struct so
+			// that acceptance matches the NIST-curve branches above; decred's
+			// ParseDERSignature is stricter and would give this one key type
+			// different leniency for no reason.
+			var ecdsaSig ecdsaSignature
+			rest, err := asn1.Unmarshal(sigBytes, &ecdsaSig)
+			if err != nil {
+				return false, errutil.UserError{Err: "supplied signature is invalid"}
+			}
+			if len(rest) != 0 {
+				return false, errutil.UserError{Err: "supplied signature contains extra data"}
+			}
+
+			if err := secp256k1ScalarFromBigInt(&r, ecdsaSig.R, "r"); err != nil {
+				return false, err
+			}
+			if err := secp256k1ScalarFromBigInt(&s, ecdsaSig.S, "s"); err != nil {
+				return false, err
+			}
+
+		case MarshalingTypeJWS:
+			// Require the exact width. The NIST branch above splits at
+			// len(sigBytes)/2 without validating, which for this curve would
+			// silently reinterpret a malformed signature.
+			if len(sigBytes) != 2*secp256k1ScalarSize {
+				return false, errutil.UserError{Err: fmt.Sprintf(
+					"supplied signature must be %d bytes for jws marshaling, got %d",
+					2*secp256k1ScalarSize, len(sigBytes))}
+			}
+
+			if overflow := r.SetByteSlice(sigBytes[:secp256k1ScalarSize]); overflow {
+				return false, errutil.UserError{Err: "supplied signature component r is not within the group order"}
+			}
+			if overflow := s.SetByteSlice(sigBytes[secp256k1ScalarSize:]); overflow {
+				return false, errutil.UserError{Err: "supplied signature component s is not within the group order"}
+			}
+			if r.IsZero() || s.IsZero() {
+				return false, errutil.UserError{Err: "supplied signature has a zero component"}
+			}
+
+		default:
+			return false, errutil.UserError{Err: "requested marshaling type is invalid"}
+		}
+
+		keyParams, err := p.safeGetKeyEntry(ver)
+		if err != nil {
+			return false, err
+		}
+
+		pubKey, err := Secp256k1PubFromKeyEntry(&keyParams)
+		if err != nil {
+			return false, err
+		}
+
+		// decred's Verify does not enforce low-S, so a signature produced
+		// elsewhere with a high S still verifies here. That is intentional --
+		// but note it means "transit says valid" is weaker than "a Bitcoin or
+		// Ethereum consensus check would accept this".
+		return dcrecdsa.NewSignature(&r, &s).Verify(input, pubKey), nil
 
 	case KeyType_ED25519:
 		var pub ed25519.PublicKey
@@ -2028,6 +2176,29 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 			return errors.New("error PEM-encoding public key")
 		}
 		entry.FormattedPublicKey = string(pemBytes)
+
+	case KeyType_ECDSA_SECP256K1:
+		// See the comment block at the top of secp256k1.go for why this branch
+		// does not go through crypto/ecdsa like the NIST curves above.
+		//
+		// Note this honours randReader, whereas the ECDSA branch above hardcodes
+		// rand.Reader.
+		privKey, err := secp256k1.GeneratePrivateKeyFromRand(randReader)
+		if err != nil {
+			return fmt.Errorf("error generating secp256k1 key: %w", err)
+		}
+		defer privKey.Zero()
+
+		pubKey := privKey.PubKey()
+		entry.EC_X = pubKey.X()
+		entry.EC_Y = pubKey.Y()
+		entry.EC_D = new(big.Int).SetBytes(privKey.Serialize())
+
+		formatted, err := FormatSecp256k1PublicKeyPEM(entry.EC_X, entry.EC_Y)
+		if err != nil {
+			return err
+		}
+		entry.FormattedPublicKey = formatted
 
 	case KeyType_ED25519:
 		// Go uses a 64-byte private key for Ed25519 keys (private+public, each
@@ -2649,6 +2820,15 @@ func (p *Policy) ImportPrivateKeyForVersion(ctx context.Context, storage logical
 }
 
 func (ke *KeyEntry) parseFromKey(PolKeyType KeyType, parsedKey any) error {
+	// Importing secp256k1 key material is not supported. Reject it up front so
+	// the caller gets an accurate reason: Go's x509 parsers do not recognise the
+	// secp256k1 curve OID (1.3.132.0.10), so a secp256k1 PKCS#8 key never even
+	// reaches here as an *ecdsa.PrivateKey, and falling through would produce a
+	// misleading curve-mismatch error instead.
+	if PolKeyType == KeyType_ECDSA_SECP256K1 {
+		return errors.New("importing key material is not supported for ecdsa-secp256k1 keys; generate the key in transit and enrol its public key with the verifier instead")
+	}
+
 	switch parsedKey.(type) {
 	case *ecdsa.PrivateKey, *ecdsa.PublicKey:
 		if PolKeyType != KeyType_ECDSA_P256 && PolKeyType != KeyType_ECDSA_P384 && PolKeyType != KeyType_ECDSA_P521 {
@@ -2936,6 +3116,12 @@ func (p *Policy) getPrivateKey(keyEntry *KeyEntry) (crypto.Signer, error) {
 		return keyEntry.RSAKey, nil
 	case KeyType_MLDSA44, KeyType_MLDSA65, KeyType_MLDSA87:
 		return keyEntry.MLDSAKey()
+	case KeyType_ECDSA_SECP256K1:
+		// This type does support signing, so the default branch's message would
+		// be wrong. It cannot satisfy crypto.Signer without a crypto/ecdsa key
+		// (see the comment block at the top of secp256k1.go), which is what the
+		// CSR and certificate-binding paths require.
+		return nil, errutil.UserError{Err: "ecdsa-secp256k1 keys do not support CSR generation or certificate binding"}
 	default:
 		return nil, errutil.InternalError{Err: fmt.Sprintf("selected key type '%s' does not support signing", p.Type.String())}
 	}
