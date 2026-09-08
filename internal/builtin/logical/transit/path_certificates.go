@@ -174,6 +174,11 @@ func (b *backend) pathImportCertChainWrite(ctx context.Context, req *logical.Req
 	defer policy.Unlock()
 
 	// check if transit key supports signing
+	// Reject unsupported binding before trying to parse the certificate.
+	if policy.Type == keysutil.KeyType_ECDSA_SECP256K1 {
+		return logical.ErrorResponse("ecdsa-secp256k1 keys do not support certificate binding"), logical.ErrInvalidRequest
+	}
+
 	if !policy.Type.SigningSupported() {
 		return logical.ErrorResponse("key type '%s' does not support signing", policy.Type), logical.ErrInvalidRequest
 	}

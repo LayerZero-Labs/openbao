@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/sdk/v2/helper/keysutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/v2/internal/builtin/logical/pki"
 	vaulthttp "github.com/openbao/openbao/v2/internal/http"
@@ -24,6 +25,10 @@ import (
 )
 
 func TestTransit_Export_KeyVersion_ExportsCorrectVersion(t *testing.T) {
+	// Exercise the common version-selection path for the new key type.
+	for _, exportType := range []string{"public-key", "signing-key", "hmac-key"} {
+		verifyExportsCorrectVersion(t, exportType, "ecdsa-secp256k1")
+	}
 	verifyExportsCorrectVersion(t, "encryption-key", "aes128-gcm96")
 	verifyExportsCorrectVersion(t, "encryption-key", "aes256-gcm96")
 	verifyExportsCorrectVersion(t, "encryption-key", "chacha20-poly1305")
@@ -398,6 +403,9 @@ func TestTransit_Export_EncryptionKey_DoesNotExportHMACKey(t *testing.T) {
 }
 
 func TestTransit_Export_CorrectFormat(t *testing.T) {
+	for _, exportType := range []string{"public-key", "signing-key", "hmac-key"} {
+		verifyExportsCorrectFormat(t, exportType, "ecdsa-secp256k1")
+	}
 	verifyExportsCorrectFormat(t, "encryption-key", "aes128-gcm96")
 	verifyExportsCorrectFormat(t, "encryption-key", "aes256-gcm96")
 	verifyExportsCorrectFormat(t, "encryption-key", "chacha20-poly1305")
@@ -484,6 +492,19 @@ func verifyExportsCorrectFormat(t *testing.T, exportType, keyType string) {
 		}
 
 		for _, k := range keys {
+			if keyType == "ecdsa-secp256k1" && exportType != "hmac-key" {
+				der := derFromExport(t, k, formatRequest)
+				switch {
+				case exportType == "public-key":
+					_, err = keysutil.ParseSecp256k1PKIXPublicKey(der)
+				case formatRequest == "":
+					_, err = keysutil.ParseSecp256k1SEC1PrivateKey(der)
+				default:
+					_, err = keysutil.ParseSecp256k1PKCS8PrivateKey(der)
+				}
+				require.NoError(t, err)
+				continue
+			}
 			if exportType != "hmac-key" && formatRequest == "" && (strings.HasPrefix(keyType, "rsa") || strings.HasPrefix(keyType, "ecdsa")) {
 				block, rest := pem.Decode([]byte(k))
 				if len(strings.TrimSpace(string(rest))) > 0 {

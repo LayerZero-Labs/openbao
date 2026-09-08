@@ -12,9 +12,23 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"testing"
+
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"gitlab.com/yawning/secp256k1-voi/secec"
 )
+
+// Public conversion permits independent verification with Decred in tests.
+func secp256k1TestPublicKey(t *testing.T, key *secec.PrivateKey) *secp256k1.PublicKey {
+	t.Helper()
+	pub, err := secp256k1.ParsePubKey(key.PublicKey().Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub
+}
 
 // Golden encodings for the fixed test scalar below.
 //
@@ -58,9 +72,7 @@ func testSecp256k1Key(t *testing.T) (d, x, y *big.Int) {
 	if err != nil {
 		t.Fatalf("could not build test key: %v", err)
 	}
-	defer priv.Zero()
-
-	pub := priv.PubKey()
+	pub := secp256k1TestPublicKey(t, priv)
 
 	// Sanity-check the derived point against the golden value, so a library
 	// swap that changed key derivation would fail loudly here rather than
@@ -159,8 +171,7 @@ func TestSecp256k1ParseRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)
 		}
-		defer priv.Zero()
-		if got := priv.Key.Bytes(); !bytes.Equal(got[:], d.FillBytes(make([]byte, 32))) {
+		if got := priv.Bytes(); !bytes.Equal(got, d.FillBytes(make([]byte, 32))) {
 			t.Fatalf("scalar mismatch: got %x", got)
 		}
 	})
@@ -170,8 +181,7 @@ func TestSecp256k1ParseRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)
 		}
-		defer priv.Zero()
-		if got := priv.PubKey().SerializeUncompressed(); !bytes.Equal(got, wantPoint) {
+		if got := priv.PublicKey().Bytes(); !bytes.Equal(got, wantPoint) {
 			t.Fatalf("got point %x, want %x", got, wantPoint)
 		}
 	})
@@ -213,8 +223,7 @@ func TestSecp256k1ShortScalarIsPadded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer priv.Zero()
-	pub := priv.PubKey()
+	pub := secp256k1TestPublicKey(t, priv)
 
 	der, err := MarshalSecp256k1SEC1PrivateKey(d, pub.X(), pub.Y())
 	if err != nil {
@@ -237,8 +246,7 @@ func TestSecp256k1ShortScalarIsPadded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("round-trip parse failed: %v", err)
 	}
-	defer back.Zero()
-	if !back.PubKey().IsEqual(pub) {
+	if !bytes.Equal(back.PublicKey().Bytes(), pub.SerializeUncompressed()) {
 		t.Fatal("round-tripped key differs from the original")
 	}
 }
@@ -358,14 +366,13 @@ func TestSecp256k1KeyEntryBridges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("private bridge failed: %v", err)
 	}
-	defer priv.Zero()
 
 	pub, err := Secp256k1PubFromKeyEntry(ke)
 	if err != nil {
 		t.Fatalf("public bridge failed: %v", err)
 	}
 
-	if !priv.PubKey().IsEqual(pub) {
+	if !bytes.Equal(priv.PublicKey().Bytes(), pub.SerializeUncompressed()) {
 		t.Fatal("private and public bridges disagree")
 	}
 
@@ -375,12 +382,32 @@ func TestSecp256k1KeyEntryBridges(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer otherPriv.Zero()
-		otherPub := otherPriv.PubKey()
+		otherPub := secp256k1TestPublicKey(t, otherPriv)
 
 		bad := &KeyEntry{EC_D: d, EC_X: otherPub.X(), EC_Y: otherPub.Y()}
 		if _, err := Secp256k1PrivFromKeyEntry(bad); err == nil {
 			t.Fatal("expected an error when the stored point does not match the scalar")
 		}
 	})
+}
+
+func TestSecp256k1KeyGenerationEntropy(t *testing.T) {
+	// Reject invalid candidates before using the next bytes from the same reader.
+	valid := make([]byte, 32)
+	valid[31] = 1
+	stream := append(make([]byte, 32), bytes.Repeat([]byte{0xff}, 32)...)
+	stream = append(stream, valid...)
+	key, err := generateSecp256k1Key(bytes.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(key.Bytes(), valid) {
+		t.Fatal("key generation did not honor the supplied entropy")
+	}
+	if _, err := generateSecp256k1Key(bytes.NewReader(nil)); err != io.EOF {
+		t.Fatalf("entropy failure must propagate, got %v", err)
+	}
+	if _, err := generateSecp256k1Key(bytes.NewReader(make([]byte, 128*32))); err == nil {
+		t.Fatal("a broken entropy source must not generate a zero private key")
+	}
 }

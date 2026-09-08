@@ -6,28 +6,19 @@ package keysutil
 // secp256k1 (a.k.a. the Koblitz curve, SECG name secp256k1, RFC 8812 JWK crv
 // "secp256k1") support for transit signing keys.
 //
-// IMPORTANT -- READ BEFORE "SIMPLIFYING" THIS FILE.
+// Secret operations use secp256k1-voi/secec: its scalar multiplication,
+// inversion, and low-S selection use constant-time arithmetic. Decred is used
+// only for public-key parsing and signature verification. Decred v4.4.1's Sign
+// and PrivateKey.PubKey use variable-time operations on secret values, including
+// math/big.ModInverse on the nonce. Do not use them in the production path.
+// Likewise, do not route this curve through crypto/ecdsa's legacy custom-curve
+// support, whose timing and FIPS behavior differ from the NIST implementations.
 //
-// This file deliberately never constructs a crypto/ecdsa key, never calls
-// elliptic.Curve, and never calls decred's secp256k1.S256() /
-// PrivateKey.ToECDSA() / PublicKey.ToECDSA() adaptors. It is tempting to do so,
-// because every neighbouring key type in policy.go is written that way and most
-// secp256k1 examples online look that way. Doing it here would be a security
-// regression, for four concrete reasons:
-//
-//  1. crypto/ecdsa routes non-NIST curves through ecdsa_legacy.go, whose
-//     verifyLegacy() *panics* under GODEBUG=fips140=only -- its signature has
-//     no error channel. That would turn transit/verify into a process-level
-//     panic on a FIPS-restricted deployment.
-//  2. signLegacy() computes s from priv.D using math/big ModInverse/Mul/Mod,
-//     which are not constant time. That is the classic ECDSA private-key
-//     extraction bug class. decred's ModNScalar arithmetic is constant time.
-//  3. Under GOEXPERIMENT=boringcrypto, SignASN1 dispatches to boringPrivateKey()
-//     *before* the curve switch, failing at a different layer than a normal
-//     build -- two divergent behaviours for one code path.
-//  4. signLegacy() does not produce low-S signatures; decred's Sign() does, per
-//     BIP-62, which is required for the blockchain use case this key type exists
-//     for.
+// secp256k1-voi's authors explicitly state that it has not been independently
+// audited. Constant-time arithmetic is a library property, not an audit or a
+// FIPS claim. Its field/scalar arithmetic is generated with fiat-crypto.
+// Private keys remain in Go-managed memory, including the persisted big.Int
+// representation; neither this code nor the library guarantees memory erasure.
 //
 // Go's crypto/x509 has no secp256k1 curve OID either, so MarshalPKIXPublicKey,
 // MarshalECPrivateKey, MarshalPKCS8PrivateKey and their Parse counterparts all
@@ -43,10 +34,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/openbao/openbao/sdk/v2/helper/errutil"
+	"gitlab.com/yawning/secp256k1-voi/secec"
 )
 
 const (
@@ -188,27 +181,31 @@ func secp256k1UncompressedPoint(x, y *big.Int) ([]byte, error) {
 	return point, nil
 }
 
-// secp256k1PrivateKeyFromScalar converts a private scalar into a decred private
+// secp256k1PrivateKeyFromScalar converts a private scalar into a secec private
 // key, rejecting zero and out-of-range values.
-func secp256k1PrivateKeyFromScalar(d *big.Int) (*secp256k1.PrivateKey, error) {
+func secp256k1PrivateKeyFromScalar(d *big.Int) (*secec.PrivateKey, error) {
 	dBytes, err := padScalarTo32(d, "EC_D")
 	if err != nil {
 		return nil, err
 	}
 
-	// SetByteSlice reports whether the value overflowed the group order. A
-	// scalar must be in [1, N-1]: zero is invalid, and anything >= N is a
-	// different key than the caller intended.
-	var scalar secp256k1.ModNScalar
-	if overflow := scalar.SetByteSlice(dBytes); overflow {
-		return nil, errors.New("keysutil: secp256k1 private scalar is greater than or equal to the group order")
-	}
+	defer clear(dBytes)
+	return secec.NewPrivateKey(dBytes)
+}
 
-	if scalar.IsZero() {
-		return nil, errors.New("keysutil: secp256k1 private scalar is zero")
+// generateSecp256k1Key samples a valid scalar using the injected entropy source.
+func generateSecp256k1Key(random io.Reader) (*secec.PrivateKey, error) {
+	var candidate [secec.PrivateKeySize]byte
+	defer clear(candidate[:])
+	for range 128 {
+		if _, err := io.ReadFull(random, candidate[:]); err != nil {
+			return nil, err
+		}
+		if key, err := secec.NewPrivateKey(candidate[:]); err == nil {
+			return key, nil
+		}
 	}
-
-	return secp256k1.NewPrivateKey(&scalar), nil
+	return nil, errors.New("keysutil: entropy source did not produce a valid secp256k1 scalar")
 }
 
 // secp256k1ScalarFromBigInt converts a signature component parsed out of DER
@@ -328,9 +325,7 @@ func marshalSecp256k1SEC1PrivateKey(d, x, y *big.Int, includeCurveOID bool) ([]b
 	if err != nil {
 		return nil, err
 	}
-	defer priv.Zero()
-
-	if derived := priv.PubKey().SerializeUncompressed(); !bytes.Equal(derived, point) {
+	if derived := priv.PublicKey().Bytes(); !bytes.Equal(derived, point) {
 		return nil, errors.New("keysutil: secp256k1 private scalar does not match the stored public point")
 	}
 
@@ -362,7 +357,7 @@ func marshalSecp256k1SEC1PrivateKey(d, x, y *big.Int, includeCurveOID bool) ([]b
 
 // ParseSecp256k1SEC1PrivateKey parses a DER RFC 5915 / SEC 1 ECPrivateKey
 // structure holding a secp256k1 private key.
-func ParseSecp256k1SEC1PrivateKey(der []byte) (*secp256k1.PrivateKey, error) {
+func ParseSecp256k1SEC1PrivateKey(der []byte) (*secec.PrivateKey, error) {
 	return parseSecp256k1SEC1PrivateKey(der, true)
 }
 
@@ -371,7 +366,7 @@ func ParseSecp256k1SEC1PrivateKey(der []byte) (*secp256k1.PrivateKey, error) {
 // requireCurveOID is false when the structure came from inside a PKCS#8
 // PrivateKeyInfo, where the curve is named by the outer AlgorithmIdentifier and
 // the inner field is conventionally absent.
-func parseSecp256k1SEC1PrivateKey(der []byte, requireCurveOID bool) (*secp256k1.PrivateKey, error) {
+func parseSecp256k1SEC1PrivateKey(der []byte, requireCurveOID bool) (*secec.PrivateKey, error) {
 	var key sec1PrivateKey
 	rest, err := asn1.Unmarshal(der, &key)
 	if err != nil {
@@ -412,8 +407,7 @@ func parseSecp256k1SEC1PrivateKey(der []byte, requireCurveOID bool) (*secp256k1.
 	// If the optional public key is present, confirm it matches the scalar.
 	if len(key.PublicKey.Bytes) != 0 {
 		point := key.PublicKey.RightAlign()
-		if derived := priv.PubKey().SerializeUncompressed(); !bytes.Equal(derived, point) {
-			priv.Zero()
+		if derived := priv.PublicKey().Bytes(); !bytes.Equal(derived, point) {
 			return nil, errors.New("keysutil: secp256k1 ECPrivateKey public key does not match its private scalar")
 		}
 	}
@@ -453,7 +447,7 @@ func MarshalSecp256k1PKCS8PrivateKey(d, x, y *big.Int) ([]byte, error) {
 
 // ParseSecp256k1PKCS8PrivateKey parses a DER RFC 5208 PrivateKeyInfo structure
 // holding a secp256k1 private key.
-func ParseSecp256k1PKCS8PrivateKey(der []byte) (*secp256k1.PrivateKey, error) {
+func ParseSecp256k1PKCS8PrivateKey(der []byte) (*secec.PrivateKey, error) {
 	var info pkcs8
 	rest, err := asn1.Unmarshal(der, &info)
 	if err != nil {
@@ -502,10 +496,7 @@ func FormatSecp256k1PublicKeyPEM(x, y *big.Int) (string, error) {
 
 // Secp256k1PrivFromKeyEntry reconstructs a secp256k1 private key from a stored
 // key version.
-//
-// The caller is responsible for calling Zero() on the result once finished with
-// it.
-func Secp256k1PrivFromKeyEntry(ke *KeyEntry) (*secp256k1.PrivateKey, error) {
+func Secp256k1PrivFromKeyEntry(ke *KeyEntry) (*secec.PrivateKey, error) {
 	if ke == nil {
 		return nil, errors.New("keysutil: nil key entry provided")
 	}
@@ -524,12 +515,10 @@ func Secp256k1PrivFromKeyEntry(ke *KeyEntry) (*secp256k1.PrivateKey, error) {
 	// against nothing, which is very hard to diagnose downstream.
 	point, err := secp256k1UncompressedPoint(ke.EC_X, ke.EC_Y)
 	if err != nil {
-		priv.Zero()
 		return nil, err
 	}
 
-	if derived := priv.PubKey().SerializeUncompressed(); !bytes.Equal(derived, point) {
-		priv.Zero()
+	if derived := priv.PublicKey().Bytes(); !bytes.Equal(derived, point) {
 		return nil, errors.New("keysutil: stored secp256k1 public point does not match the private scalar")
 	}
 

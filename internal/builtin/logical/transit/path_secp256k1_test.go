@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openbao/openbao/sdk/v2/helper/keysutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -355,15 +356,6 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 	require.False(t, backupResp.IsError(), "%#v", backupResp)
 	backup := backupResp.Data["backup"].(string)
 
-	_, err = b.HandleRequest(t.Context(), &logical.Request{
-		Storage:   s,
-		Operation: logical.DeleteOperation,
-		Path:      "keys/dvn",
-	})
-	// Deletion requires deletion_allowed; restore under a new name instead.
-	// (Ignore the error: the point is only that the original may still exist.)
-	_ = err
-
 	restoreResp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.UpdateOperation,
@@ -394,6 +386,15 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, true, verifyResp.Data["valid"], "signature made before backup did not verify after restore")
+
+	// Signing proves the private scalar survived, not just the public key.
+	signAfter, err := b.HandleRequest(t.Context(), &logical.Request{
+		Storage: s, Operation: logical.UpdateOperation, Path: "sign/restored",
+		Data: map[string]any{"input": testSecp256k1DigestB64},
+	})
+	require.NoError(t, err)
+	require.False(t, signAfter.IsError())
+	require.Equal(t, sigBefore, signAfter.Data["signature"])
 }
 
 // TestTransit_Secp256k1_UnsupportedOperations asserts every out-of-scope
@@ -422,9 +423,43 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "datakey/plaintext/dvn",
+			Path:      "derive-key/derived",
+			Data: map[string]any{
+				"base_key_name":   "dvn",
+				"peer_public_key": "unused: key agreement must be rejected before parsing",
+			},
 		})
-		require.True(t, err != nil || (resp != nil && resp.IsError()), "datakey should be refused")
+		require.ErrorIs(t, err, logical.ErrInvalidRequest)
+		require.Contains(t, resp.Error().Error(), "does not support key agreement")
+	})
+
+	t.Run("certificate binding", func(t *testing.T) {
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/set-certificate",
+			Data: map[string]any{"certificate_chain": "unused: binding must be rejected before parsing"},
+		})
+		require.ErrorIs(t, err, logical.ErrInvalidRequest)
+		require.Contains(t, resp.Error().Error(), "do not support certificate binding")
+	})
+
+	t.Run("BYOK export", func(t *testing.T) {
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/wrapping",
+			Data: map[string]any{"type": "rsa-2048"},
+		})
+		require.NoError(t, err)
+		require.False(t, resp.IsError())
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/config",
+			Data: map[string]any{"exportable": true},
+		})
+		require.NoError(t, err)
+		require.False(t, resp.IsError())
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "byok-export/wrapping/dvn",
+		})
+		require.ErrorIs(t, err, logical.ErrInvalidRequest)
+		require.Contains(t, resp.Error().Error(), "BYOK export is not supported")
 	})
 
 	t.Run("csr", func(t *testing.T) {
@@ -484,6 +519,39 @@ func TestTransit_Secp256k1_AutoRotateRejected(t *testing.T) {
 		})
 		require.True(t, err != nil || (resp != nil && resp.IsError()),
 			"auto_rotate_period should be refused via keys/config, got %#v", resp)
+
+		// A rejected write must leave both cached and persisted state intact.
+		read, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
+		})
+		require.NoError(t, err)
+		require.EqualValues(t, 0, read.Data["auto_rotate_period"])
+
+		resp, err = b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/config",
+			Data: map[string]any{"deletion_allowed": true},
+		})
+		require.NoError(t, err)
+		require.False(t, resp.IsError())
+		fresh := createBackendWithForceNoCacheWithSysViewWithStorage(t, s)
+		read, err = fresh.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
+		})
+		require.NoError(t, err)
+		require.EqualValues(t, 0, read.Data["auto_rotate_period"])
+
+		p, _, err := b.GetPolicyExclusive(t.Context(), keysutil.PolicyRequest{Storage: s, Name: "dvn"}, b.GetRandomReader())
+		require.NoError(t, err)
+		entry := p.Keys["1"]
+		entry.CreationTime = time.Now().Add(-48 * time.Hour)
+		p.Keys["1"] = entry
+		p.Unlock()
+		require.NoError(t, b.autoRotateKeys(t.Context(), &logical.Request{Storage: s}))
+		read, err = b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
+		})
+		require.NoError(t, err)
+		require.Equal(t, 1, read.Data["latest_version"])
 	})
 }
 

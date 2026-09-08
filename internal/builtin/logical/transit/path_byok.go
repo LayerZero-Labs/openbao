@@ -107,6 +107,11 @@ func (b *backend) pathPolicyBYOKExportRead(ctx context.Context, req *logical.Req
 		return nil, fmt.Errorf("for source key: %v", keysutil.ErrSoftDeleted)
 	}
 
+	// Unsupported operations are client errors, including all-version export.
+	if srcP.Type == keysutil.KeyType_ECDSA_SECP256K1 {
+		return logical.ErrorResponse("BYOK export is not supported for key type %v", srcP.Type), logical.ErrInvalidRequest
+	}
+
 	retKeys := map[string]string{}
 	switch version {
 	case "":

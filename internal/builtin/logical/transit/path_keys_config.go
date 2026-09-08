@@ -110,6 +110,7 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 	originalDeletionAllowed := p.DeletionAllowed
 	originalExportable := p.Exportable
 	originalAllowPlaintextBackup := p.AllowPlaintextBackup
+	originalAutoRotatePeriod := p.AutoRotatePeriod
 
 	defer func() {
 		if retErr != nil || (resp != nil && resp.IsError()) {
@@ -118,6 +119,7 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 			p.DeletionAllowed = originalDeletionAllowed
 			p.Exportable = originalExportable
 			p.AllowPlaintextBackup = originalAllowPlaintextBackup
+			p.AutoRotatePeriod = originalAutoRotatePeriod
 		}
 	}()
 
@@ -223,12 +225,7 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 			return logical.ErrorResponse("auto rotate period must be 0 to disable or at least an hour"), nil
 		}
 
-		if autoRotatePeriod != p.AutoRotatePeriod {
-			p.AutoRotatePeriod = autoRotatePeriod
-			persistNeeded = true
-		}
-
-		if p.Type == keysutil.KeyType_ExternalKey && p.AutoRotatePeriod != 0 {
+		if p.Type == keysutil.KeyType_ExternalKey && autoRotatePeriod != 0 {
 			return logical.ErrorResponse("auto rotate period must be disabled on external keys"), nil
 		}
 
@@ -240,8 +237,14 @@ func (b *backend) pathKeysConfigWrite(ctx context.Context, req *logical.Request,
 		// identity a verifier has enrolled out of band. Clients also commonly
 		// cache that identity for their process lifetime, so a surprise
 		// rotation makes them keep signing under one that no longer matches.
-		if p.Type == keysutil.KeyType_ECDSA_SECP256K1 && p.AutoRotatePeriod != 0 {
+		if p.Type == keysutil.KeyType_ECDSA_SECP256K1 && autoRotatePeriod != 0 {
 			return logical.ErrorResponse("auto rotate period must be disabled on ecdsa-secp256k1 keys, because rotation changes the derived blockchain address"), nil
+		}
+
+		// Validate before changing the shared cached policy.
+		if autoRotatePeriod != p.AutoRotatePeriod {
+			p.AutoRotatePeriod = autoRotatePeriod
+			persistNeeded = true
 		}
 	}
 

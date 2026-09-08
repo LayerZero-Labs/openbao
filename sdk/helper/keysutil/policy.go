@@ -47,6 +47,7 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/helper/kdf"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"gitlab.com/yawning/secp256k1-voi/secec"
 
 	"github.com/tink-crypto/tink-go/v2/kwp/subtle"
 )
@@ -1430,11 +1431,8 @@ func (p *Policy) SignWithOptions(ver int, derivationContext, input []byte, optio
 		// does not go through crypto/ecdsa.
 		//
 		// HashSignatureInput() is false for this type, so input arrives exactly
-		// as the caller supplied it and must already be a digest. Enforce the
-		// width: decred's ModNScalar.SetByteSlice zero-extends a short slice and
-		// truncates a long one, so without this check a caller who passed a
-		// 20-byte or 64-byte value would get a valid signature over a scalar
-		// they never intended.
+		// as the caller supplied it and must already be a 32-byte digest.
+		// Enforce the API contract before handing it to the crypto library.
 		if len(input) != secp256k1ScalarSize {
 			return nil, errutil.UserError{Err: fmt.Sprintf(
 				"secp256k1 signing requires a %d-byte digest as input, got %d bytes; hash the message yourself (Ethereum uses Keccak-256) and pass the digest",
@@ -1445,34 +1443,23 @@ func (p *Policy) SignWithOptions(ver int, derivationContext, input []byte, optio
 		if err != nil {
 			return nil, err
 		}
-		defer privKey.Zero()
-
-		// decred's Sign is RFC 6979 deterministic and already emits a low-S
-		// (BIP-62 canonical) signature, so there is deliberately no n-s
-		// normalization here.
-		signature := dcrecdsa.Sign(privKey, input)
-
+		// SHA-256 is used only inside RFC 6979 nonce generation. Sign takes
+		// the caller's digest verbatim; ECDSAOptions only checks its length.
+		var encoding secec.SignatureEncoding
 		switch marshaling {
 		case MarshalingTypeASN1:
-			// Serialize() produces strict, minimally-encoded, low-S DER. Do not
-			// round-trip this through encoding/asn1: that would gain nothing and
-			// risks emitting a non-minimal INTEGER.
-			sig = signature.Serialize()
-
+			encoding = secec.EncodingASN1
 		case MarshalingTypeJWS:
-			// Fixed-width r||s. secp256k1 is a 256-bit curve, so this is always
-			// exactly 64 bytes.
-			r, s := signature.R(), signature.S()
-			var rb, sb [secp256k1ScalarSize]byte
-			r.PutBytes(&rb)
-			s.PutBytes(&sb)
-
-			sig = make([]byte, 0, 2*secp256k1ScalarSize)
-			sig = append(sig, rb[:]...)
-			sig = append(sig, sb[:]...)
-
+			encoding = secec.EncodingCompact
 		default:
 			return nil, errutil.UserError{Err: "requested marshaling type is invalid"}
+		}
+		sig, err = privKey.Sign(secec.RFC6979SHA256(), input, &secec.ECDSAOptions{
+			Encoding:   encoding,
+			SelfVerify: true,
+		})
+		if err != nil {
+			return nil, err
 		}
 
 	case KeyType_ED25519:
@@ -1794,9 +1781,8 @@ func (p *Policy) VerifySignatureWithOptions(derivationContext, input []byte, sig
 		}
 
 		// decred's Verify does not enforce low-S, so a signature produced
-		// elsewhere with a high S still verifies here. That is intentional --
-		// but note it means "transit says valid" is weaker than "a Bitcoin or
-		// Ethereum consensus check would accept this".
+		// elsewhere with a high S still verifies here. A downstream verifier,
+		// such as OpenZeppelin ECDSA, may require low-S separately.
 		return dcrecdsa.NewSignature(&r, &s).Verify(input, pubKey), nil
 
 	case KeyType_ED25519:
@@ -2183,16 +2169,16 @@ func (p *Policy) RotateInMemory(randReader io.Reader) (retErr error) {
 		//
 		// Note this honours randReader, whereas the ECDSA branch above hardcodes
 		// rand.Reader.
-		privKey, err := secp256k1.GeneratePrivateKeyFromRand(randReader)
+		privKey, err := generateSecp256k1Key(randReader)
 		if err != nil {
 			return fmt.Errorf("error generating secp256k1 key: %w", err)
 		}
-		defer privKey.Zero()
-
-		pubKey := privKey.PubKey()
-		entry.EC_X = pubKey.X()
-		entry.EC_Y = pubKey.Y()
-		entry.EC_D = new(big.Int).SetBytes(privKey.Serialize())
+		pubKey := privKey.PublicKey().Bytes()
+		entry.EC_X = new(big.Int).SetBytes(pubKey[1:33])
+		entry.EC_Y = new(big.Int).SetBytes(pubKey[33:])
+		privateBytes := privKey.Bytes()
+		entry.EC_D = new(big.Int).SetBytes(privateBytes)
+		clear(privateBytes)
 
 		formatted, err := FormatSecp256k1PublicKeyPEM(entry.EC_X, entry.EC_Y)
 		if err != nil {
@@ -3117,10 +3103,7 @@ func (p *Policy) getPrivateKey(keyEntry *KeyEntry) (crypto.Signer, error) {
 	case KeyType_MLDSA44, KeyType_MLDSA65, KeyType_MLDSA87:
 		return keyEntry.MLDSAKey()
 	case KeyType_ECDSA_SECP256K1:
-		// This type does support signing, so the default branch's message would
-		// be wrong. It cannot satisfy crypto.Signer without a crypto/ecdsa key
-		// (see the comment block at the top of secp256k1.go), which is what the
-		// CSR and certificate-binding paths require.
+		// x509 does not support this curve's public-key encoding.
 		return nil, errutil.UserError{Err: "ecdsa-secp256k1 keys do not support CSR generation or certificate binding"}
 	default:
 		return nil, errutil.InternalError{Err: fmt.Sprintf("selected key type '%s' does not support signing", p.Type.String())}
@@ -3141,6 +3124,11 @@ func (p *Policy) getECDSAKeyCurve() (elliptic.Curve, error) {
 }
 
 func (p *Policy) PersistCertificateChain(ctx context.Context, storage logical.Storage, keyVersion int, certificateChain []*x509.Certificate) error {
+	// Keep the SDK contract consistent with Transit's binding endpoint.
+	if p.Type == KeyType_ECDSA_SECP256K1 {
+		return errutil.UserError{Err: "ecdsa-secp256k1 keys do not support certificate binding"}
+	}
+
 	// validate that the certificate chain has at least one certifiate, the leaf certificate
 	if len(certificateChain) == 0 {
 		return errutil.UserError{Err: "expected at least one certificate in the certificate chain"}

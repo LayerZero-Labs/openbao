@@ -5,10 +5,13 @@ package keysutil
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 
@@ -108,8 +111,7 @@ func secp256k1PolicyFromScalar(t *testing.T, d *big.Int) *Policy {
 	if err != nil {
 		t.Fatalf("could not build key: %v", err)
 	}
-	defer priv.Zero()
-	pub := priv.PubKey()
+	pub := secp256k1TestPublicKey(t, priv)
 
 	return &Policy{
 		l:             new(sync.RWMutex),
@@ -271,11 +273,12 @@ func TestSecp256k1SignIsLowS(t *testing.T) {
 	d, _ := new(big.Int).SetString(testSecp256k1ScalarHex, 16)
 	p := secp256k1PolicyFromScalar(t, d)
 
-	// Vary the digest rather than the key, since signing is deterministic.
+	// Check independent random digests, including both possible S parities.
 	digest := make([]byte, 32)
-	for i := range 512 {
-		digest[0] = byte(i)
-		digest[1] = byte(i >> 8)
+	for i := range 1000 {
+		if _, err := rand.Read(digest); err != nil {
+			t.Fatal(err)
+		}
 
 		res, err := p.SignWithOptions(0, nil, digest, &SigningOptions{Marshaling: MarshalingTypeJWS})
 		if err != nil {
@@ -385,7 +388,7 @@ func TestSecp256k1CrossVerifyWithDecred(t *testing.T) {
 	der := decodeSigForTest(t, p, res.Signature, MarshalingTypeASN1)
 
 	// ParseDERSignature is stricter than encoding/asn1: it requires minimal,
-	// canonical DER. Our sign path uses decred's Serialize(), so this must pass.
+	// canonical DER. Check the signing library's output independently.
 	sig, err := dcrecdsa.ParseDERSignature(der)
 	if err != nil {
 		t.Fatalf("decred rejected our DER: %v", err)
@@ -408,14 +411,19 @@ func TestSecp256k1CrossVerifyWithDecred(t *testing.T) {
 func TestSecp256k1RejectsBadInputLength(t *testing.T) {
 	d, _ := new(big.Int).SetString(testSecp256k1ScalarHex, 16)
 	p := secp256k1PolicyFromScalar(t, d)
+	// Use a valid signature so malformed DER cannot mask a missing guard.
+	res, err := p.SignWithOptions(0, nil, make([]byte, 32), &SigningOptions{Marshaling: MarshalingTypeASN1})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for _, n := range []int{0, 1, 20, 31, 33, 64} {
 		input := make([]byte, n)
 		if _, err := p.SignWithOptions(0, nil, input, &SigningOptions{Marshaling: MarshalingTypeASN1}); err == nil {
 			t.Errorf("sign accepted a %d-byte input; only 32 is valid", n)
 		}
-		if _, err := p.VerifySignatureWithOptions(nil, input, "vault:v1:AAAA", &SigningOptions{Marshaling: MarshalingTypeASN1}); err == nil {
-			t.Errorf("verify accepted a %d-byte input; only 32 is valid", n)
+		if _, err := p.VerifySignatureWithOptions(nil, input, res.Signature, &SigningOptions{Marshaling: MarshalingTypeASN1}); err == nil || !strings.Contains(err.Error(), "32-byte digest") {
+			t.Errorf("verify must reject %d-byte input with a digest-length error, got %v", n, err)
 		}
 	}
 }
@@ -439,6 +447,26 @@ func TestSecp256k1RejectsMalformedSignatures(t *testing.T) {
 		}
 	})
 
+	t.Run("jws invalid scalars", func(t *testing.T) {
+		// Scalar range checks must reject malformed encodings, not just
+		// return valid=false because the sample happens to be a bad signature.
+		for name, pair := range map[string][2]*big.Int{
+			"zero r":     {big.NewInt(0), big.NewInt(1)},
+			"zero s":     {big.NewInt(1), big.NewInt(0)},
+			"r equals n": {n, big.NewInt(1)},
+			"s equals n": {big.NewInt(1), n},
+			"s above n":  {big.NewInt(1), new(big.Int).Add(n, big.NewInt(1))},
+		} {
+			raw := make([]byte, 64)
+			pair[0].FillBytes(raw[:32])
+			pair[1].FillBytes(raw[32:])
+			valid, err := p.VerifySignatureWithOptions(nil, digest, encodeSigForTest(p, raw, MarshalingTypeJWS), &SigningOptions{Marshaling: MarshalingTypeJWS})
+			if err == nil || valid {
+				t.Errorf("%s: expected an invalid-scalar error, got valid=%v err=%v", name, valid, err)
+			}
+		}
+	})
+
 	t.Run("asn1 degenerate components", func(t *testing.T) {
 		for name, sigStruct := range map[string]ecdsaSignature{
 			"zero r":     {R: big.NewInt(0), S: big.NewInt(1)},
@@ -446,9 +474,12 @@ func TestSecp256k1RejectsMalformedSignatures(t *testing.T) {
 			"negative r": {R: big.NewInt(-1), S: big.NewInt(1)},
 			"r equals n": {R: n, S: big.NewInt(1)},
 			"s equals n": {R: big.NewInt(1), S: n},
+			"s above n":  {R: big.NewInt(1), S: new(big.Int).Add(n, big.NewInt(1))},
+			"negative s": {R: big.NewInt(1), S: big.NewInt(-1)},
 			// 33 bytes: exercises the truncation guard, since
 			// ModNScalar.SetByteSlice would keep only the first 32 bytes.
-			"oversized r": {R: new(big.Int).Lsh(big.NewInt(1), 264), S: big.NewInt(1)},
+			"oversized r": {R: new(big.Int).Lsh(big.NewInt(1), 256), S: big.NewInt(1)},
+			"oversized s": {R: big.NewInt(1), S: new(big.Int).Lsh(big.NewInt(1), 256)},
 		} {
 			der, err := asn1.Marshal(sigStruct)
 			if err != nil {
@@ -457,8 +488,8 @@ func TestSecp256k1RejectsMalformedSignatures(t *testing.T) {
 			sig := encodeSigForTest(p, der, MarshalingTypeASN1)
 
 			ok, err := p.VerifySignatureWithOptions(nil, digest, sig, &SigningOptions{Marshaling: MarshalingTypeASN1})
-			if err == nil && ok {
-				t.Errorf("%s: verify accepted a degenerate signature", name)
+			if err == nil || ok {
+				t.Errorf("%s: verify must reject a degenerate signature with an error", name)
 			}
 		}
 	})
@@ -508,6 +539,40 @@ func TestSecp256k1KeyTypePredicates(t *testing.T) {
 	}
 }
 
+// Public fixture from go-ethereum v1.16.3, crypto/signature_test.go:
+// https://github.com/ethereum/go-ethereum/blob/v1.16.3/crypto/signature_test.go
+// These literal testmsg/testsig/testpubkey values were read from that source.
+func TestSecp256k1EthereumVector(t *testing.T) {
+	digest := mustHex(t, "ce0677bb30baa8cf067c88db9811f4333d131bf8bcf12fe7065d211dce971008")
+	rsv := mustHex(t, "90f27b8b488db00b00606796d2987f6a5f59ae62ea05effe84fef5b8b0e549984a691139ad57a3f0b906637673aa2f63d1f55cb1a69199d4009eea23ceaddc9301")
+	point := mustHex(t, "04e32df42865e97135acfb65f3bae71bdc86f4d49150ad6a440b6f15878109880a0a2b2667f7e725ceea70c673093bf67663e0312623c8e091b13cf2c0f11ef652")
+	p := &Policy{
+		Type: KeyType_ECDSA_SECP256K1, LatestVersion: 1,
+		Keys: keyEntryMap{"1": KeyEntry{
+			EC_X: new(big.Int).SetBytes(point[1:33]),
+			EC_Y: new(big.Int).SetBytes(point[33:]),
+		}},
+	}
+	der, err := asn1.Marshal(ecdsaSignature{R: new(big.Int).SetBytes(rsv[:32]), S: new(big.Int).SetBytes(rsv[32:64])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for marshaling, sig := range map[MarshalingType][]byte{MarshalingTypeJWS: rsv[:64], MarshalingTypeASN1: der} {
+		valid, err := p.VerifySignatureWithOptions(nil, digest, encodeSigForTest(p, sig, marshaling), &SigningOptions{Marshaling: marshaling})
+		if err != nil || !valid {
+			t.Fatalf("Ethereum fixture did not verify: valid=%v err=%v", valid, err)
+		}
+	}
+	compact := append([]byte{27 + rsv[64]}, rsv[:64]...)
+	recovered, _, err := dcrecdsa.RecoverCompact(compact, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recovered.SerializeUncompressed(), point) {
+		t.Fatal("Ethereum fixture recovered the wrong public key")
+	}
+}
+
 // TestSecp256k1KeyTypeConstantValue pins the persisted integer value. Policy
 // .Type is stored as a raw int, so a change here silently reinterprets every
 // key already written to storage.
@@ -517,6 +582,19 @@ func TestSecp256k1KeyTypeConstantValue(t *testing.T) {
 	}
 	if KeyType_MLDSA87 != 14 {
 		t.Fatalf("KeyType_MLDSA87 = %d, want 14; the iota block was reordered", KeyType_MLDSA87)
+	}
+	// Pin decoding of the on-disk integer format independently of constants.
+	for fixture, want := range map[string]string{
+		`{"type":15}`: "ecdsa-secp256k1",
+		`{"type":14}`: "mldsa-87",
+	} {
+		var p Policy
+		if err := json.Unmarshal([]byte(fixture), &p); err != nil {
+			t.Fatal(err)
+		}
+		if p.Type.String() != want {
+			t.Fatalf("%s decoded as %s, want %s", fixture, p.Type, want)
+		}
 	}
 }
 
@@ -536,6 +614,9 @@ func TestSecp256k1UnsupportedOperations(t *testing.T) {
 		// signing; assert we produced the accurate message instead.
 		if got := err.Error(); !bytes.Contains([]byte(got), []byte("CSR generation")) {
 			t.Errorf("got %q, want a message mentioning CSR generation", got)
+		}
+		if err := p.PersistCertificateChain(t.Context(), nil, 1, nil); err == nil || !strings.Contains(err.Error(), "certificate binding") {
+			t.Fatalf("certificate binding must be rejected explicitly, got %v", err)
 		}
 	})
 
