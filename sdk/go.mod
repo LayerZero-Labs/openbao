@@ -52,9 +52,9 @@ require (
 	github.com/tink-crypto/tink-go/v2 v2.8.0
 	// Constant-time secp256k1 secret operations; Decred handles public operations.
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b
-	golang.org/x/crypto v0.56.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/net v0.58.0
-	golang.org/x/text v0.41.0
+	golang.org/x/text v0.42.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 )
