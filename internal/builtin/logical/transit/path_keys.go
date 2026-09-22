@@ -80,9 +80,9 @@ The type of key to create. Currently, "aes128-gcm96", "aes256-gcm96",
 "aes256-gcm96".
 
 Note that "ecdsa-secp256k1" signs a caller-supplied 32-byte digest verbatim and
-does not hash its input, since blockchain signing schemes use Keccak-256 with
-their own domain separation. It also does not support key import, key
-agreement, CSR generation, or auto-rotation.
+does not hash its input, so the caller chooses the digest function and its
+domain separation. It also does not support key import, key agreement, or CSR
+generation.
 `,
 			},
 
@@ -301,8 +301,8 @@ func (b *backend) pathPolicyWrite(ctx context.Context, req *logical.Request, d *
 		polReq.KeyType = keysutil.KeyType_ECDSA_P521
 	case "ecdsa-secp256k1", "ecdsa-p256k1":
 		// "ecdsa-p256k1" is accepted as an alias in case the other spelling is
-		// the one that gets standardised on. The
-		// canonical name, returned by KeyType.String(), is "ecdsa-secp256k1".
+		// the one that gets standardised on. The canonical name, returned by
+		// KeyType.String(), is "ecdsa-secp256k1".
 		polReq.KeyType = keysutil.KeyType_ECDSA_SECP256K1
 	case "ed25519":
 		polReq.KeyType = keysutil.KeyType_ED25519

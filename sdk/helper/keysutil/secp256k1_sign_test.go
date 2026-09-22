@@ -539,10 +539,14 @@ func TestSecp256k1KeyTypePredicates(t *testing.T) {
 	}
 }
 
+// TestSecp256k1InteropVector checks our verification against a known-answer
+// vector produced by an independent secp256k1 implementation, so a regression
+// in our own encoding cannot make the test agree with itself.
+//
 // Public fixture from go-ethereum v1.16.3, crypto/signature_test.go:
 // https://github.com/ethereum/go-ethereum/blob/v1.16.3/crypto/signature_test.go
-// These literal testmsg/testsig/testpubkey values were read from that source.
-func TestSecp256k1EthereumVector(t *testing.T) {
+// The literal testmsg/testsig/testpubkey values were read from that source.
+func TestSecp256k1InteropVector(t *testing.T) {
 	digest := mustHex(t, "ce0677bb30baa8cf067c88db9811f4333d131bf8bcf12fe7065d211dce971008")
 	rsv := mustHex(t, "90f27b8b488db00b00606796d2987f6a5f59ae62ea05effe84fef5b8b0e549984a691139ad57a3f0b906637673aa2f63d1f55cb1a69199d4009eea23ceaddc9301")
 	point := mustHex(t, "04e32df42865e97135acfb65f3bae71bdc86f4d49150ad6a440b6f15878109880a0a2b2667f7e725ceea70c673093bf67663e0312623c8e091b13cf2c0f11ef652")
@@ -560,7 +564,7 @@ func TestSecp256k1EthereumVector(t *testing.T) {
 	for marshaling, sig := range map[MarshalingType][]byte{MarshalingTypeJWS: rsv[:64], MarshalingTypeASN1: der} {
 		valid, err := p.VerifySignatureWithOptions(nil, digest, encodeSigForTest(p, sig, marshaling), &SigningOptions{Marshaling: marshaling})
 		if err != nil || !valid {
-			t.Fatalf("Ethereum fixture did not verify: valid=%v err=%v", valid, err)
+			t.Fatalf("interop fixture did not verify: valid=%v err=%v", valid, err)
 		}
 	}
 	compact := append([]byte{27 + rsv[64]}, rsv[:64]...)
@@ -569,7 +573,7 @@ func TestSecp256k1EthereumVector(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(recovered.SerializeUncompressed(), point) {
-		t.Fatal("Ethereum fixture recovered the wrong public key")
+		t.Fatal("interop fixture recovered the wrong public key")
 	}
 }
 

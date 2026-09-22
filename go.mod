@@ -32,7 +32,6 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cockroachdb/pebble v1.1.5
 	github.com/containerd/platforms v0.2.1
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/duosecurity/duo_api_golang v0.3.0
 	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/fatih/color v1.19.0
@@ -206,6 +205,7 @@ require (
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/coreos/go-oidc/v3 v3.11.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1 // indirect
 	github.com/denverdino/aliyungo v0.0.0-20190125010748-a747050bb1ba // indirect
 	github.com/digitalocean/godo v1.7.5 // indirect
 	github.com/distribution/reference v0.6.0 // indirect

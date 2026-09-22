@@ -15,8 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A fixed 32-byte digest, standing in for the Keccak-256 hash a blockchain
-// client would compute (e.g. an EIP-191 personal_sign digest).
+// A fixed 32-byte digest, standing in for whatever hash the caller computed
+// before handing it to Transit. This key type never hashes its input.
 const testSecp256k1DigestB64 = "SmxBmh4lyFMnEVxKzlht7N3+KZDtjz1NgBhxFYM4UB0="
 
 func secp256k1CreateKey(t *testing.T, b *backend, s logical.Storage, name string) {
@@ -33,16 +33,16 @@ func secp256k1CreateKey(t *testing.T, b *backend, s logical.Storage, name string
 }
 
 // TestTransit_Secp256k1_CreateAndRead covers key creation and the read path,
-// including the two things a DVN client depends on: the curve name and a
-// parseable public key.
+// including the two fields a client depends on: the curve name and a parseable
+// public key.
 func TestTransit_Secp256k1_CreateAndRead(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	resp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.ReadOperation,
-		Path:      "keys/dvn",
+		Path:      "keys/test",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -69,8 +69,7 @@ func TestTransit_Secp256k1_CreateAndRead(t *testing.T) {
 	pub, err := keysutil.ParseSecp256k1PKIXPublicKey(block.Bytes)
 	require.NoError(t, err, "public_key did not parse as a secp256k1 SPKI")
 
-	// The uncompressed point is what a client slices to get X||Y in order to
-	// derive a blockchain address.
+	// The uncompressed point is what a client slices to get X||Y.
 	require.Len(t, pub.SerializeUncompressed(), 65)
 	require.Equal(t, byte(0x04), pub.SerializeUncompressed()[0])
 }
@@ -79,14 +78,14 @@ func TestTransit_Secp256k1_CreateAndRead(t *testing.T) {
 // paths for both marshalings.
 func TestTransit_Secp256k1_SignVerify(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	for _, marshaling := range []string{"asn1", "jws"} {
 		t.Run(marshaling, func(t *testing.T) {
 			signResp, err := b.HandleRequest(t.Context(), &logical.Request{
 				Storage:   s,
 				Operation: logical.UpdateOperation,
-				Path:      "sign/dvn",
+				Path:      "sign/test",
 				Data: map[string]any{
 					"input":                testSecp256k1DigestB64,
 					"marshaling_algorithm": marshaling,
@@ -103,7 +102,7 @@ func TestTransit_Secp256k1_SignVerify(t *testing.T) {
 			verifyResp, err := b.HandleRequest(t.Context(), &logical.Request{
 				Storage:   s,
 				Operation: logical.UpdateOperation,
-				Path:      "verify/dvn",
+				Path:      "verify/test",
 				Data: map[string]any{
 					"input":                testSecp256k1DigestB64,
 					"signature":            sig,
@@ -129,13 +128,13 @@ func TestTransit_Secp256k1_SignVerify(t *testing.T) {
 // signed verbatim, and any other length must be refused rather than hashed.
 func TestTransit_Secp256k1_NoImplicitHashing(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	t.Run("32-byte digest needs no prehashed flag", func(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "sign/dvn",
+			Path:      "sign/test",
 			Data:      map[string]any{"input": testSecp256k1DigestB64},
 		})
 		require.NoError(t, err)
@@ -156,7 +155,7 @@ func TestTransit_Secp256k1_NoImplicitHashing(t *testing.T) {
 			resp, err := b.HandleRequest(t.Context(), &logical.Request{
 				Storage:   s,
 				Operation: logical.UpdateOperation,
-				Path:      "sign/dvn",
+				Path:      "sign/test",
 				Data:      map[string]any{"input": plaintext},
 			})
 			isError := err != nil || (resp != nil && resp.IsError())
@@ -261,13 +260,13 @@ func derFromExport(t *testing.T, out, format string) []byte {
 // TestTransit_Secp256k1_Rotation covers multiple key versions.
 func TestTransit_Secp256k1_Rotation(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	for range 2 {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "keys/dvn/rotate",
+			Path:      "keys/test/rotate",
 		})
 		require.NoError(t, err)
 		require.False(t, resp != nil && resp.IsError(), "%#v", resp)
@@ -276,7 +275,7 @@ func TestTransit_Secp256k1_Rotation(t *testing.T) {
 	resp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.ReadOperation,
-		Path:      "keys/dvn",
+		Path:      "keys/test",
 	})
 	require.NoError(t, err)
 	keys := resp.Data["keys"].(map[string]map[string]any)
@@ -294,7 +293,7 @@ func TestTransit_Secp256k1_Rotation(t *testing.T) {
 		signResp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "sign/dvn",
+			Path:      "sign/test",
 			Data: map[string]any{
 				"input":       testSecp256k1DigestB64,
 				"key_version": ver,
@@ -306,7 +305,7 @@ func TestTransit_Secp256k1_Rotation(t *testing.T) {
 		verifyResp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "verify/dvn",
+			Path:      "verify/test",
 			Data: map[string]any{
 				"input":     testSecp256k1DigestB64,
 				"signature": signResp.Data["signature"],
@@ -327,7 +326,7 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 	resp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.UpdateOperation,
-		Path:      "keys/dvn",
+		Path:      "keys/test",
 		Data: map[string]any{
 			"type":                   "ecdsa-secp256k1",
 			"allow_plaintext_backup": true,
@@ -340,7 +339,7 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 	signResp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.UpdateOperation,
-		Path:      "sign/dvn",
+		Path:      "sign/test",
 		Data:      map[string]any{"input": testSecp256k1DigestB64},
 	})
 	require.NoError(t, err)
@@ -350,7 +349,7 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 	backupResp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.ReadOperation,
-		Path:      "backup/dvn",
+		Path:      "backup/test",
 	})
 	require.NoError(t, err)
 	require.False(t, backupResp.IsError(), "%#v", backupResp)
@@ -402,7 +401,7 @@ func TestTransit_Secp256k1_BackupRestore(t *testing.T) {
 // "unknown key type".
 func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	t.Run("import", func(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
@@ -425,7 +424,7 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 			Operation: logical.UpdateOperation,
 			Path:      "derive-key/derived",
 			Data: map[string]any{
-				"base_key_name":   "dvn",
+				"base_key_name":   "test",
 				"peer_public_key": "unused: key agreement must be rejected before parsing",
 			},
 		})
@@ -435,7 +434,7 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 
 	t.Run("certificate binding", func(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/set-certificate",
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/test/set-certificate",
 			Data: map[string]any{"certificate_chain": "unused: binding must be rejected before parsing"},
 		})
 		require.ErrorIs(t, err, logical.ErrInvalidRequest)
@@ -450,13 +449,13 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, resp.IsError())
 		resp, err = b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/config",
+			Storage: s, Operation: logical.UpdateOperation, Path: "keys/test/config",
 			Data: map[string]any{"exportable": true},
 		})
 		require.NoError(t, err)
 		require.False(t, resp.IsError())
 		resp, err = b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.ReadOperation, Path: "byok-export/wrapping/dvn",
+			Storage: s, Operation: logical.ReadOperation, Path: "byok-export/wrapping/test",
 		})
 		require.ErrorIs(t, err, logical.ErrInvalidRequest)
 		require.Contains(t, resp.Error().Error(), "BYOK export is not supported")
@@ -466,7 +465,7 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "keys/dvn/csr",
+			Path:      "keys/test/csr",
 		})
 		require.True(t, err != nil || (resp != nil && resp.IsError()), "CSR generation should be refused")
 		if resp != nil && resp.IsError() {
@@ -479,20 +478,31 @@ func TestTransit_Secp256k1_UnsupportedOperations(t *testing.T) {
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "encrypt/dvn",
+			Path:      "encrypt/test",
 			Data:      map[string]any{"plaintext": base64.StdEncoding.EncodeToString([]byte("hello"))},
 		})
 		require.True(t, err != nil || (resp != nil && resp.IsError()), "encryption should be refused")
 	})
 }
 
-// TestTransit_Secp256k1_AutoRotateRejected covers both ways auto-rotation could
-// be enabled. Rotation changes the derived blockchain address, so allowing it
-// silently breaks on-chain signer enrolment.
-func TestTransit_Secp256k1_AutoRotateRejected(t *testing.T) {
-	b, s := createBackendWithStorage(t)
+// TestTransit_Secp256k1_AutoRotate covers both ways auto-rotation can be
+// enabled, and confirms a due key actually rotates. Auto-rotation is off by
+// default for this type, as it is for every other key type, but nothing
+// refuses it.
+func TestTransit_Secp256k1_AutoRotate(t *testing.T) {
+	t.Run("defaults to disabled", func(t *testing.T) {
+		b, s := createBackendWithStorage(t)
+		secp256k1CreateKey(t, b, s, "test")
+
+		read, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/test",
+		})
+		require.NoError(t, err)
+		require.EqualValues(t, 0, read.Data["auto_rotate_period"])
+	})
 
 	t.Run("at creation", func(t *testing.T) {
+		b, s := createBackendWithStorage(t)
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
@@ -502,56 +512,75 @@ func TestTransit_Secp256k1_AutoRotateRejected(t *testing.T) {
 				"auto_rotate_period": "24h",
 			},
 		})
-		require.True(t, err != nil || (resp != nil && resp.IsError()),
-			"auto_rotate_period should be refused at creation, got %#v", resp)
+		require.NoError(t, err)
+		require.False(t, resp != nil && resp.IsError(), "creation failed: %#v", resp)
+
+		read, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/autorotate",
+		})
+		require.NoError(t, err)
+		require.EqualValues(t, 24*60*60, read.Data["auto_rotate_period"])
 	})
 
-	// The creation-time guard alone is not enough: without a matching check on
-	// keys/config it could be bypassed by enabling rotation after the fact.
 	t.Run("via keys/config", func(t *testing.T) {
-		secp256k1CreateKey(t, b, s, "dvn")
+		b, s := createBackendWithStorage(t)
+		secp256k1CreateKey(t, b, s, "test")
 
 		resp, err := b.HandleRequest(t.Context(), &logical.Request{
 			Storage:   s,
 			Operation: logical.UpdateOperation,
-			Path:      "keys/dvn/config",
+			Path:      "keys/test/config",
 			Data:      map[string]any{"auto_rotate_period": "24h"},
 		})
-		require.True(t, err != nil || (resp != nil && resp.IsError()),
-			"auto_rotate_period should be refused via keys/config, got %#v", resp)
-
-		// A rejected write must leave both cached and persisted state intact.
-		read, err := b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
-		})
 		require.NoError(t, err)
-		require.EqualValues(t, 0, read.Data["auto_rotate_period"])
+		require.False(t, resp != nil && resp.IsError(), "config write failed: %#v", resp)
 
-		resp, err = b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.UpdateOperation, Path: "keys/dvn/config",
-			Data: map[string]any{"deletion_allowed": true},
-		})
-		require.NoError(t, err)
-		require.False(t, resp.IsError())
+		// The period must survive a round trip through storage, not just live
+		// in the cached policy.
 		fresh := createBackendWithForceNoCacheWithSysViewWithStorage(t, s)
-		read, err = fresh.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
+		read, err := fresh.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/test",
 		})
 		require.NoError(t, err)
-		require.EqualValues(t, 0, read.Data["auto_rotate_period"])
+		require.EqualValues(t, 24*60*60, read.Data["auto_rotate_period"])
+	})
 
-		p, _, err := b.GetPolicyExclusive(t.Context(), keysutil.PolicyRequest{Storage: s, Name: "dvn"}, b.GetRandomReader())
+	t.Run("a due key rotates", func(t *testing.T) {
+		b, s := createBackendWithStorage(t)
+		secp256k1CreateKey(t, b, s, "test")
+
+		resp, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage:   s,
+			Operation: logical.UpdateOperation,
+			Path:      "keys/test/config",
+			Data:      map[string]any{"auto_rotate_period": "24h"},
+		})
+		require.NoError(t, err)
+		require.False(t, resp != nil && resp.IsError(), "config write failed: %#v", resp)
+
+		// Back-date the only key version so the rotation is overdue.
+		p, _, err := b.GetPolicyExclusive(t.Context(), keysutil.PolicyRequest{Storage: s, Name: "test"}, b.GetRandomReader())
 		require.NoError(t, err)
 		entry := p.Keys["1"]
 		entry.CreationTime = time.Now().Add(-48 * time.Hour)
 		p.Keys["1"] = entry
 		p.Unlock()
+
 		require.NoError(t, b.autoRotateKeys(t.Context(), &logical.Request{Storage: s}))
-		read, err = b.HandleRequest(t.Context(), &logical.Request{
-			Storage: s, Operation: logical.ReadOperation, Path: "keys/dvn",
+
+		read, err := b.HandleRequest(t.Context(), &logical.Request{
+			Storage: s, Operation: logical.ReadOperation, Path: "keys/test",
 		})
 		require.NoError(t, err)
-		require.Equal(t, 1, read.Data["latest_version"])
+		require.Equal(t, 2, read.Data["latest_version"])
+
+		// The rotated-in version must be a usable secp256k1 key, not an empty
+		// or wrong-curve entry.
+		keys, ok := read.Data["keys"].(map[string]map[string]any)
+		require.True(t, ok, "unexpected keys shape %T", read.Data["keys"])
+		require.Contains(t, keys, "2")
+		require.Equal(t, "secp256k1", keys["2"]["name"])
+		require.NotEmpty(t, keys["2"]["public_key"])
 	})
 }
 
@@ -559,12 +588,12 @@ func TestTransit_Secp256k1_AutoRotateRejected(t *testing.T) {
 // populated before the key-type switch in RotateInMemory.
 func TestTransit_Secp256k1_HMAC(t *testing.T) {
 	b, s := createBackendWithStorage(t)
-	secp256k1CreateKey(t, b, s, "dvn")
+	secp256k1CreateKey(t, b, s, "test")
 
 	resp, err := b.HandleRequest(t.Context(), &logical.Request{
 		Storage:   s,
 		Operation: logical.UpdateOperation,
-		Path:      "hmac/dvn",
+		Path:      "hmac/test",
 		Data:      map[string]any{"input": testSecp256k1DigestB64},
 	})
 	require.NoError(t, err)

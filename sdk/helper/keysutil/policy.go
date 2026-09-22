@@ -190,15 +190,14 @@ func (kt KeyType) MLDSAExternalMuSupported() bool {
 // caller's input before handing it to Sign.
 //
 // KeyType_ECDSA_SECP256K1 is deliberately absent. Callers of a secp256k1 key
-// sign a digest they computed themselves under a domain-separating scheme the
-// backend cannot reconstruct -- an Ethereum RLP transaction hash, an EIP-191
-// personal_sign digest, an EIP-712 struct hash -- and those all use Keccak-256,
-// which is not in HashType at all (sha3-* here is FIPS-202, a different
-// padding). Returning true would mean that a caller who omitted prehashed=true
-// got their digest silently SHA-256'd and signed, producing a perfectly valid
-// signature over the wrong 32 bytes with no error and no way to detect it from
-// the response. Instead this type takes a raw 32-byte digest, like ed25519 and
-// mldsa-*, and Sign/VerifySignature reject any other input length.
+// sign a digest they computed themselves, under a domain-separating scheme the
+// backend cannot reconstruct and often with a hash function that is not in
+// HashType at all. Returning true would mean that a caller who omitted
+// prehashed=true got their digest silently SHA-256'd and signed, producing a
+// perfectly valid signature over the wrong 32 bytes with no error and no way to
+// detect it from the response. Instead this type takes a raw 32-byte digest,
+// like ed25519 and mldsa-*, and Sign/VerifySignature reject any other input
+// length.
 func (kt KeyType) HashSignatureInput() bool {
 	switch kt {
 	case KeyType_ECDSA_P256, KeyType_ECDSA_P384, KeyType_ECDSA_P521,
@@ -1435,7 +1434,7 @@ func (p *Policy) SignWithOptions(ver int, derivationContext, input []byte, optio
 		// Enforce the API contract before handing it to the crypto library.
 		if len(input) != secp256k1ScalarSize {
 			return nil, errutil.UserError{Err: fmt.Sprintf(
-				"secp256k1 signing requires a %d-byte digest as input, got %d bytes; hash the message yourself (Ethereum uses Keccak-256) and pass the digest",
+				"secp256k1 signing requires a %d-byte digest as input, got %d bytes; hash the message yourself and pass the digest",
 				secp256k1ScalarSize, len(input))}
 		}
 
