@@ -1,4 +1,6 @@
-# OpenBao
+This branch is a secp256k1 signer core fork of openbao that illustrates a proof of concept for using Transit for signing with secp256k1 keys.
+
+## OpenBao
 
 ----
 
